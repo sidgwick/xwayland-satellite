@@ -2556,8 +2556,8 @@ fn fractional_scale_small_popup() {
     {
         let data = f.testwl.get_surface_data(toplevel_id).unwrap();
         let viewport = data.viewport.as_ref().expect("Missing viewport");
-        assert_eq!(viewport.width, 67);
-        assert_eq!(viewport.height, 67);
+        assert_eq!(viewport.width, 100);
+        assert_eq!(viewport.height, 100);
     }
 
     f.reconfigure_window(
@@ -3160,6 +3160,106 @@ fn client_side_decorations() {
     check_window_and_viewport_size(&f, window, id, 100, 100);
     assert!(f.testwl.get_surface_data(subsurface_id).is_none());
     assert!(!subsurface.is_alive());
+}
+
+#[test]
+fn fractional_scale_change_resizes_mapped_toplevel() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let compositor = f.compositor();
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+
+    f.testwl
+        .get_surface_data(id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale")
+        .preferred_scale(180); // 1.5 scale
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(window).dims.width,
+            f.connection().window(window).dims.height
+        ),
+        (150, 150),
+        "X window pixel size at scale 1.5"
+    );
+    let viewport = f
+        .testwl
+        .get_surface_data(id)
+        .unwrap()
+        .viewport
+        .as_ref()
+        .unwrap();
+    assert_eq!((viewport.width, viewport.height), (100, 100));
+
+    f.testwl
+        .get_surface_data(id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale")
+        .preferred_scale(120); // 1.0 scale
+    f.run();
+    f.run();
+    assert_eq!(
+        (
+            f.connection().window(window).dims.width,
+            f.connection().window(window).dims.height
+        ),
+        (100, 100),
+        "X window pixel size at scale 1.0"
+    );
+}
+
+#[test]
+fn pointer_scale_tracks_fractional_scale_changes() {
+    fn pointer_scale<C: XConnection>(fixture: &TestFixture<C>) -> f64 {
+        fixture
+            .satellite
+            .world
+            .query::<(
+                &wayland_server::protocol::wl_pointer::WlPointer,
+                &super::event::SurfaceScaleFactor,
+            )>()
+            .iter()
+            .next()
+            .expect("Missing pointer scale factor")
+            .1
+            .1
+            .0
+    }
+
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let compositor = f.compositor();
+    TestObject::<WlPointer>::from_request(&compositor.seat.obj, wl_seat::Request::GetPointer {});
+
+    let window = Window::new(1);
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+
+    f.testwl.move_pointer_to(id, 25.0, 25.0);
+    f.run();
+    assert_eq!(pointer_scale(&f), 1.0);
+
+    f.testwl
+        .get_surface_data(id)
+        .unwrap()
+        .fractional
+        .as_ref()
+        .expect("Missing fractional scale")
+        .preferred_scale(180); // 1.5 scale
+    f.run();
+    f.run();
+
+    assert_eq!(pointer_scale(&f), 1.5);
 }
 
 #[test]

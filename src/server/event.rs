@@ -51,12 +51,16 @@ use wayland_server::protocol::{
 #[derive(Copy, Clone)]
 pub(super) struct SurfaceScaleFactor(pub f64);
 
+#[derive(Copy, Clone)]
+pub(super) struct PreferredScaleFactor(pub f64);
+
 #[derive(hecs::Bundle)]
 pub(super) struct SurfaceBundle {
     pub client: client::wl_surface::WlSurface,
     pub server: WlSurface,
     pub viewport: WpViewport,
     pub scale: SurfaceScaleFactor,
+    pub preferred_scale: PreferredScaleFactor,
 }
 
 #[derive(Debug)]
@@ -94,29 +98,59 @@ impl Event for SurfaceEvents {
             SurfaceEvents::FractionalScale(event) => match event {
                 wp_fractional_scale_v1::Event::PreferredScale { scale } => {
                     let state = state.deref_mut();
-                    let entity = state.world.entity(target).unwrap();
                     let factor = scale as f64 / 120.0;
-                    debug!(
-                        "{} scale factor: {}",
-                        entity.get::<&WlSurface>().unwrap().id(),
-                        factor
-                    );
+                    let output = {
+                        let entity = state.world.entity(target).unwrap();
+                        debug!(
+                            "{} scale factor: {}",
+                            entity.get::<&WlSurface>().unwrap().id(),
+                            factor
+                        );
 
-                    entity.get::<&mut SurfaceScaleFactor>().unwrap().0 = factor;
+                        entity.get::<&mut PreferredScaleFactor>().unwrap().0 = factor;
+                        let output = entity
+                            .get::<&OnOutput>()
+                            .as_deref()
+                            .copied()
+                            .map(|OnOutput(output)| output);
+                        output
+                    };
 
-                    if let Some(OnOutput(output)) = entity.get::<&OnOutput>().as_deref().copied() {
+                    if let Some(output) = output {
                         if update_output_scale(
                             state.world.query_one(output).unwrap(),
                             OutputScaleFactor::Fractional(factor),
                         ) {
                             state.updated_outputs.push(output);
                         }
-                    }
-                    if entity.has::<WindowData>() {
-                        update_surface_viewport(
-                            &state.world,
-                            state.world.query_one(target).unwrap(),
-                        );
+                    } else {
+                        // Before the surface is associated with an output, use its preferred
+                        // scale only when no output scale is known yet. Otherwise, keep it at
+                        // the global X11 scale until the output association is processed.
+                        let has_outputs = state
+                            .world
+                            .query::<&OutputScaleFactor>()
+                            .iter()
+                            .next()
+                            .is_some();
+                        let effective_scale = if has_outputs {
+                            state.current_scale
+                        } else {
+                            factor
+                        };
+                        let changed =
+                            update_surface_scale(&mut state.world, target, effective_scale);
+                        if changed {
+                            let mut pointers = state
+                                .world
+                                .query::<(&CurrentSurface, &mut SurfaceScaleFactor)>();
+                            for (_, (current_surface, pointer_scale)) in pointers.iter() {
+                                if matches!(current_surface, CurrentSurface::Xwayland(s) if *s == target)
+                                {
+                                    pointer_scale.0 = effective_scale;
+                                }
+                            }
+                        }
                     }
                 }
                 _ => unreachable!(),
@@ -195,6 +229,7 @@ impl SurfaceEvents {
         let data = state.world.entity(target).unwrap();
         let surface = data.get::<&WlSurface>().unwrap();
         let mut cmd = CommandBuffer::new();
+        let mut sync_surface_scale = false;
         match event {
             Event::Enter { output } => {
                 let output_entity = output.data().copied().unwrap();
@@ -231,14 +266,9 @@ impl SurfaceEvents {
 
                     if state.fractional_scale.is_none() {
                         let output_scale = output_data.get::<&OutputScaleFactor>().unwrap().get();
-                        data.get::<&mut SurfaceScaleFactor>().unwrap().0 = output_scale;
-                        drop(query);
-                        update_surface_viewport(
-                            &state.world,
-                            state.world.query_one(target).unwrap(),
-                        );
+                        data.get::<&mut PreferredScaleFactor>().unwrap().0 = output_scale;
                     } else {
-                        let scale = data.get::<&SurfaceScaleFactor>().unwrap();
+                        let scale = data.get::<&PreferredScaleFactor>().unwrap();
                         if update_output_scale(
                             state.world.query_one(on_output.0).unwrap(),
                             OutputScaleFactor::Fractional(scale.0),
@@ -247,6 +277,7 @@ impl SurfaceEvents {
                         }
                     }
                 }
+                sync_surface_scale = true;
                 cmd.insert_one(target, on_output);
             }
             Event::Leave { output } => {
@@ -267,6 +298,17 @@ impl SurfaceEvents {
         }
 
         drop(surface);
+        if sync_surface_scale && update_surface_scale(&mut state.world, target, state.current_scale)
+        {
+            let mut pointers = state
+                .world
+                .query::<(&CurrentSurface, &mut SurfaceScaleFactor)>();
+            for (_, (current_surface, pointer_scale)) in pointers.iter() {
+                if matches!(current_surface, CurrentSurface::Xwayland(s) if *s == target) {
+                    pointer_scale.0 = state.current_scale;
+                }
+            }
+        }
         cmd.run_on(&mut state.world);
     }
 
@@ -509,6 +551,58 @@ pub(super) fn update_surface_viewport(
     }
 }
 
+pub(super) fn update_surface_scale(world: &mut World, target: Entity, factor: f64) -> bool {
+    let old_factor = world.get::<&SurfaceScaleFactor>(target).unwrap().0;
+    if factor == old_factor {
+        return false;
+    }
+
+    let pending = {
+        let entity = world.entity(target).unwrap();
+        if entity.has::<WindowData>() && entity.has::<x::Window>() && entity.has::<SurfaceRole>() {
+            let mut query = entity.query::<(&mut WindowData, &x::Window, &SurfaceRole)>();
+            let (window_data, window, role) = query.get().unwrap();
+            if window_data.mapped
+                && role.xdg().is_some_and(|xdg| xdg.configured)
+                && old_factor > 0.0
+            {
+                let ratio = factor / old_factor;
+                let dims = &mut window_data.attrs.dims;
+                dims.width = (f64::from(dims.width) * ratio)
+                    .round()
+                    .clamp(1.0, f64::from(u16::MAX)) as u16;
+                dims.height = (f64::from(dims.height) * ratio)
+                    .round()
+                    .clamp(1.0, f64::from(u16::MAX)) as u16;
+
+                Some((
+                    *window,
+                    PendingSurfaceState {
+                        x: i32::from(dims.x),
+                        y: i32::from(dims.y),
+                        width: i32::from(dims.width),
+                        height: i32::from(dims.height),
+                    },
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    world.get::<&mut SurfaceScaleFactor>(target).unwrap().0 = factor;
+    if let Some((window, pending)) = pending {
+        debug!("resizing {window:?} for scale factor {old_factor} -> {factor}");
+        world.insert_one(target, pending).unwrap();
+    }
+    if world.entity(target).unwrap().has::<WindowData>() {
+        update_surface_viewport(world, world.query_one(target).unwrap());
+    }
+    true
+}
+
 pub(super) fn update_size_hints(data: &ToplevelData, hints: &WmNormalHints, scale: f64) {
     let decorations_height = if data.decoration.satellite.is_some() {
         DecorationsDataSatellite::TITLEBAR_HEIGHT
@@ -553,7 +647,7 @@ impl Event for client::wl_seat::Event {
 }
 
 struct PendingEnter(client::wl_pointer::Event);
-enum CurrentSurface {
+pub(super) enum CurrentSurface {
     Xwayland(Entity),
     Decoration(Entity),
 }
@@ -1003,6 +1097,9 @@ impl Event for client::wl_touch::Event {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) struct OnOutput(pub Entity);
+// This entity receives xdg-output events used for scale detection without forwarding them
+// to Xwayland's own xdg-output object.
+pub(super) struct OutputScaleProbe(pub Entity);
 struct OutputName(String);
 fn get_output_name(output: Option<&OnOutput>, world: &World) -> Option<String> {
     output.map(|o| world.get::<&OutputName>(o.0).unwrap().0.clone())
@@ -1046,6 +1143,26 @@ fn update_output_scale(
     false
 }
 
+fn update_output_inferred_scale<C: XConnection>(output: Entity, state: &mut ServerState<C>) {
+    let scale = state
+        .world
+        .get::<&OutputDimensions>(output)
+        .ok()
+        .and_then(|dimensions| dimensions.inferred_scale());
+    if let Some(scale) = scale {
+        if update_output_scale(
+            state.world.query_one(output).unwrap(),
+            OutputScaleFactor::Fractional(scale),
+        ) {
+            debug!(
+                "inferred {} scale: {scale}",
+                state.world.get::<&WlOutput>(output).unwrap().id()
+            );
+            state.updated_outputs.push(output);
+        }
+    }
+}
+
 enum OutputDimensionsSource {
     // The data in this variant is the values needed for the wl_output.geometry event.
     Wl {
@@ -1066,6 +1183,7 @@ pub(super) struct OutputDimensions {
     pub width: i32,
     pub height: i32,
     rotated_90: bool,
+    logical_size: Option<(i32, i32)>,
 }
 
 impl Default for OutputDimensions {
@@ -1084,7 +1202,34 @@ impl Default for OutputDimensions {
             width: 0,
             height: 0,
             rotated_90: false,
+            logical_size: None,
         }
+    }
+}
+
+impl OutputDimensions {
+    pub(super) fn initial_scale_ready(&self) -> bool {
+        self.width > 0 && self.height > 0 && self.logical_size.is_some()
+    }
+
+    fn inferred_scale(&self) -> Option<f64> {
+        let (logical_width, logical_height) = self.logical_size?;
+        if self.width <= 0 || self.height <= 0 || logical_width <= 0 || logical_height <= 0 {
+            return None;
+        }
+        let (physical_width, physical_height) = if self.rotated_90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        let horizontal = physical_width as f64 / logical_width as f64;
+        let vertical = physical_height as f64 / logical_height as f64;
+        if (horizontal - vertical).abs() > 0.05 {
+            return None;
+        }
+        // Logical sizes are rounded to integer pixels; use the fractional-scale protocol's
+        // 1/120 unit so both sources agree on the same scale value.
+        Some((((horizontal + vertical) / 2.0) * 120.0).round() / 120.0)
     }
 }
 
@@ -1343,6 +1488,7 @@ impl OutputEvent {
                         xdg.logical_size(dimensions.width, dimensions.height);
                     }
                 }
+                update_output_inferred_scale(target, state);
             }
             Event::Scale { factor } => {
                 debug!(
@@ -1394,6 +1540,21 @@ impl OutputEvent {
         state: &mut ServerState<C>,
     ) {
         use zxdg_output_v1::Event;
+
+        let probe_output = state
+            .world
+            .get::<&OutputScaleProbe>(target)
+            .ok()
+            .map(|probe| probe.0);
+        if let Some(output) = probe_output {
+            if let Event::LogicalSize { width, height } = event {
+                if let Ok(mut dimensions) = state.world.get::<&mut OutputDimensions>(output) {
+                    dimensions.logical_size = Some((width, height));
+                }
+                update_output_inferred_scale(output, state);
+            }
+            return;
+        }
 
         match event {
             Event::LogicalPosition { x, y } => {

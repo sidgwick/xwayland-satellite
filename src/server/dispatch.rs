@@ -235,6 +235,7 @@ impl<S: X11Selection>
                         server,
                         viewport,
                         scale: SurfaceScaleFactor(state.current_scale),
+                        preferred_scale: PreferredScaleFactor(state.current_scale),
                     },
                 );
                 if let Some(f) = fractional {
@@ -1472,6 +1473,13 @@ impl<S: X11Selection> GlobalDispatch<WlOutput, Global> for InnerServerState<S> {
                 &state.qh,
                 entity,
             );
+        if let Some(manager) = state.output_manager.as_ref() {
+            let probe_entity = state.world.reserve_entity();
+            let probe = manager.get_xdg_output(&client, &state.qh, probe_entity);
+            state
+                .world
+                .spawn_at(probe_entity, (probe, event::OutputScaleProbe(entity)));
+        }
         state.world.spawn_at(
             entity,
             (

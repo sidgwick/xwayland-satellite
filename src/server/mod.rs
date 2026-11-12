@@ -60,7 +60,11 @@ use wayland_protocols::{
             xdg_toplevel::{self, XdgToplevel},
             xdg_wm_base::XdgWmBase,
         },
-        xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        xdg_output::zv1::{
+            client::zxdg_output_manager_v1::ZxdgOutputManagerV1 as OutputManClient,
+            client::zxdg_output_v1::ZxdgOutputV1 as XdgOutputClient,
+            server::zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        },
     },
     xwayland::shell::v1::server::xwayland_shell_v1::XwaylandShellV1,
 };
@@ -482,6 +486,7 @@ pub struct InnerServerState<S: X11Selection> {
     shm: client::wl_shm::WlShm,
     viewporter: WpViewporter,
     fractional_scale: Option<WpFractionalScaleManagerV1>,
+    output_manager: Option<OutputManClient>,
     decoration_manager: Option<ZxdgDecorationManagerV1>,
     selection_states: selection::SelectionStates<S>,
     last_kb_serial: Option<(client::wl_seat::WlSeat, u32)>,
@@ -491,6 +496,7 @@ pub struct InnerServerState<S: X11Selection> {
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
     current_scale: f64,
+    initial_scale_set: bool,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -543,6 +549,10 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             })
             .ok();
 
+        let output_manager = global_list
+            .bind::<OutputManClient, _, _>(&qh, 1..=3, ())
+            .ok();
+
         let activation_state = ActivationState::bind(&global_list, &qh)
             .inspect_err(|e| {
                 warn!("Could not bind xdg activation ({e:?}). Windows might not receive focus depending on compositor focus stealing policy.")
@@ -583,6 +593,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             shm,
             viewporter,
             fractional_scale,
+            output_manager,
             selection_states,
             last_kb_serial: None,
             activation_state,
@@ -600,6 +611,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             updated_outputs: Vec::new(),
             new_scale: None,
             current_scale: 1.0,
+            initial_scale_set: false,
             decoration_manager,
             world,
         };
@@ -651,18 +663,6 @@ impl<C: XConnection> ServerState<C> {
             event.handle(target, self);
         }
 
-        let query = self.world.query_mut::<(&x::Window, &PendingSurfaceState)>();
-        let iter = query
-            .into_iter()
-            .map(|(e, (win, dims))| (e, (*win, *dims)))
-            .collect::<Vec<_>>();
-        for (entity, (win, dims)) in iter.into_iter() {
-            self.connection.set_window_dims(win, dims);
-            self.world
-                .remove_one::<PendingSurfaceState>(entity)
-                .unwrap();
-        }
-
         if self.global_output_offset.x.owner.is_none()
             || self.global_output_offset.y.owner.is_none()
         {
@@ -687,59 +687,92 @@ impl<C: XConnection> ServerState<C> {
             self.global_offset_updated = false;
         }
 
-        if !self.updated_outputs.is_empty() {
-            for output in std::mem::take(&mut self.updated_outputs).iter() {
-                let Ok(output_scale) = self.world.get::<&OutputScaleFactor>(*output) else {
-                    continue;
-                };
-                if matches!(*output_scale, OutputScaleFactor::Output(..)) {
-                    let mut surface_query = self
-                        .world
-                        .query::<(&OnOutput, &mut SurfaceScaleFactor)>()
-                        .with::<(&WindowData, &WlSurface)>();
+        let output_scale_changed = !std::mem::take(&mut self.updated_outputs).is_empty();
+        // X11 has one DPI setting. After the initial outputs are known, keep it stable
+        // across hotplug events so mapped clients do not retain buffers at the old size.
+        // Compositors without xdg-output retain the previous dynamic scale behavior.
+        if !self.initial_scale_set || self.output_manager.is_none() {
+            let expected_outputs = self
+                .globals_map
+                .values()
+                .filter(|(global, _)| global.interface == <WlOutput>::interface().name)
+                .count();
+            let outputs = self
+                .world
+                .query::<(&OutputScaleFactor, &OutputDimensions)>()
+                .iter()
+                .map(|(_, (scale, dimensions))| {
+                    let ready = dimensions.width > 0
+                        && dimensions.height > 0
+                        && (self.output_manager.is_none() || dimensions.initial_scale_ready());
+                    (scale.get(), ready)
+                })
+                .collect::<Vec<_>>();
 
-                    let mut surfaces = vec![];
-                    for (surface, (OnOutput(s_output), surface_scale)) in surface_query.iter() {
-                        if s_output == output {
-                            surface_scale.0 = output_scale.get();
-                            surfaces.push(surface);
+            let ready = if self.output_manager.is_some() {
+                expected_outputs > 0
+                    && outputs.len() == expected_outputs
+                    && outputs.iter().all(|(_, ready)| *ready)
+            } else {
+                !outputs.is_empty()
+            };
+            if ready {
+                let scale = outputs
+                    .iter()
+                    .map(|(scale, _)| *scale)
+                    .fold(f64::INFINITY, f64::min);
+                if self.output_manager.is_some() {
+                    self.initial_scale_set = true;
+                }
+                if (self.initial_scale_set || output_scale_changed)
+                    && outputs
+                        .iter()
+                        .any(|(output_scale, _)| *output_scale != scale)
+                {
+                    warn!("Mixed output scales detected, using {scale}x for X11 apps");
+                }
+                if scale != self.current_scale {
+                    debug!("Using global scale {scale}");
+                    let old_scale = self.current_scale;
+                    self.current_scale = scale;
+                    self.new_scale = Some(scale);
+
+                    // X11 has one global DPI setting. Keep every Xwayland surface at that same
+                    // scale so its buffer size, viewport, and pointer coordinates agree.
+                    let surfaces = self
+                        .world
+                        .query::<(&WlSurface, &SurfaceScaleFactor)>()
+                        .iter()
+                        .map(|(surface, _)| surface)
+                        .collect::<Vec<_>>();
+                    for surface in surfaces {
+                        event::update_surface_scale(&mut self.world, surface, scale);
+                    }
+
+                    let mut pointers = self
+                        .world
+                        .query::<(&CurrentSurface, &mut SurfaceScaleFactor)>();
+                    for (_, (current_surface, pointer_scale)) in pointers.iter() {
+                        if matches!(current_surface, CurrentSurface::Xwayland(_)) {
+                            pointer_scale.0 = scale;
                         }
                     }
 
-                    drop(surface_query);
-                    for surface in surfaces {
-                        update_surface_viewport(
-                            &self.world,
-                            self.world.query_one(surface).unwrap(),
-                        );
-                    }
+                    debug!("applied Xwayland global scale {old_scale} -> {scale}");
                 }
             }
+        }
 
-            let mut mixed_scale = false;
-            let mut scale;
-
-            let mut outputs = self.world.query_mut::<&OutputScaleFactor>().into_iter();
-            if let Some((_, output_scale)) = outputs.next() {
-                scale = output_scale.get();
-
-                for (_, output_scale) in outputs {
-                    if output_scale.get() != scale {
-                        mixed_scale = true;
-                        scale = scale.min(output_scale.get());
-                    }
-                }
-
-                if mixed_scale {
-                    warn!(
-                        "Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)"
-                    );
-                }
-
-                debug!("Using new scale {scale}");
-                self.new_scale = Some(scale);
-                self.current_scale = scale;
-            }
+        let query = self.world.query_mut::<(&x::Window, &PendingSurfaceState)>();
+        let iter = query
+            .into_iter()
+            .map(|(e, (win, dims))| (e, (*win, *dims)))
+            .collect::<Vec<_>>();
+        for (entity, (win, dims)) in iter.into_iter() {
+            self.connection.set_window_dims(win, dims);
+            self.world
+                .remove_one::<PendingSurfaceState>(entity)
+                .unwrap();
         }
 
         {
@@ -846,6 +879,20 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         for (entity, name) in query.iter() {
             if *name == global {
                 self.updated_outputs.push(*entity);
+                let probes = self
+                    .world
+                    .query::<(&OutputScaleProbe, &XdgOutputClient)>()
+                    .iter()
+                    .filter(|(_, (probe, _))| probe.0 == *entity)
+                    .map(|(probe_entity, _)| probe_entity)
+                    .collect::<Vec<_>>();
+                for probe_entity in probes {
+                    self.world
+                        .get::<&XdgOutputClient>(probe_entity)
+                        .unwrap()
+                        .destroy();
+                    self.world.despawn(probe_entity).unwrap();
+                }
                 self.world
                     .remove::<(OutputScaleFactor, OutputDimensions)>(*entity)
                     .unwrap();
